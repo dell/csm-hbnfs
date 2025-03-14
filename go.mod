@@ -1,12 +1,11 @@
 module github.com/dell/csm-hbnfs
 
-go 1.23.0
-
-toolchain go1.24.1
+go 1.24
 
 require (
 	github.com/container-storage-interface/spec v1.8.0
 	github.com/dell/gocsi v1.12.0
+	github.com/golang/mock v1.6.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.9.0
 	go.uber.org/mock v0.5.0
