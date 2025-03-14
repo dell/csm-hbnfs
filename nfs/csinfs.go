@@ -60,41 +60,94 @@ type CsiNfsService struct {
 	executor  Executor
 }
 
+// OSInterface is an interface that is satisfied by various functions from the
+// stdlib os package. It is used to mock out OS calls in unit tests to avoid
+// interacting with the OS directly.
+//
+//go:generate mockgen -destination=mocks/os.go -package=mocks . OSInterface
+type OSInterface interface {
+	// os.Stat()
+	Stat(string) (os.FileInfo, error)
+	// os.Getenv()
+	Getenv(string) string
+	// os.MkdirAll()
+	MkdirAll(string, os.FileMode) error
+}
+
+type OSImpl struct{}
+
+var opSys OSInterface = &OSImpl{}
+
+func (o *OSImpl) Stat(filepath string) (os.FileInfo, error) {
+	return os.Stat(filepath)
+}
+
+func (o *OSImpl) Getenv(envName string) string {
+	return os.Getenv(envName)
+}
+
+func (o *OSImpl) MkdirAll(fileName string, perm os.FileMode) error {
+	return os.MkdirAll(fileName, perm)
+}
+
 func IsNFSStorageClass(parameters map[string]string) bool {
 	return parameters["csi-nfs"] == "RWX"
 }
 
-func IsNFSVolumeID(volumeID string) bool {
-	return strings.HasPrefix(volumeID, CsiNfsPrefixDash)
+func hasNFSPrefix(id string) bool {
+	return strings.HasPrefix(id, CsiNfsPrefixDash)
 }
 
-func IsNFSSnapshotID(volumeID string) bool {
-	return strings.HasPrefix(volumeID, CsiNfsPrefixDash)
-}
+var (
+	IsNFSVolumeID   = hasNFSPrefix
+	IsNFSSnapshotID = hasNFSPrefix
+)
 
 func NFSToArrayVolumeID(id string) string {
 	return strings.TrimPrefix(id, CsiNfsPrefixDash)
 }
 
+// VolumeIDToServiceName takes an id and converts it to a valid DNS name,
+// replacing all instances of characters that are not alphanumeric, '-', or '.'
+// with the '-' character, removing any leading or trailing characters that are
+// not alphanumeric, converting any uppercase alpha characters to lowercase,
+// and truncating any strings that exceed 63 chars by removing excess characters.
 func VolumeIDToServiceName(id string) string {
-	rule := "^[a-z0-9]+([-.]?[a-z0-9]+)*$"
-	match, _ := regexp.MatchString(rule, id)
+	// matches any single lowercase alphanumeric, '-', and '.' chars.
+	validTerminalCharRegex := regexp.MustCompile("[a-z0-9]")
+	// matches any single character that is not lowercase alphanumeric, '-', or '.'
+	illegalCharRegex := regexp.MustCompile("[^a-z0-9-.]")
+	// matches a whole word that consists of lowercase alphanumerics, '-', or '.',
+	// and both begins and ends with a lowercase alphanumeric,
+	validIDRegex := "^[a-z0-9]+([-.]?[a-z0-9]+)*$"
 
+	id = strings.ToLower(id)
+
+	// remove any leading or trailing illegal chars
+	validIndexes := validTerminalCharRegex.FindAllIndex([]byte(id), -1)
+	if validIndexes != nil {
+		// find the index of the first and last valid char and remove everything before the first
+		// valid char, and everything after the last valid char
+		id = id[validIndexes[0][0]:validIndexes[len(validIndexes)-1][1]]
+	}
+
+	// confirm the length does not exceed 63 chars
+	if len(id) > 63 {
+		id = id[:63]
+	}
+
+	// check the format of the string.
+	// if it passes the check, return it.
+	match, _ := regexp.MatchString(validIDRegex, id)
 	if match {
 		return id
 	}
 
-	re := regexp.MustCompile("[^a-z0-9-.]")
-	cleaned := re.ReplaceAllStringFunc(id, func(match string) string {
-		if match == strings.ToLower(match) {
-			return "-"
-		}
-		return strings.ToLower(match)
+	// if it fails the check, replace any illegal chars with '-'
+	cleaned := illegalCharRegex.ReplaceAllStringFunc(id, func(match string) string {
+		// replace all characters that are not alpha chars with '-'
+		return "-"
 	})
-
-	if len(cleaned) > 63 {
-		cleaned = cleaned[:63]
-	}
 
 	return cleaned
 }
@@ -118,17 +171,16 @@ func PutVcsiService(vcsi Service) {
 	nfsService.vcsi = vcsi
 }
 
-func PutMDService(md Service) {
-	nfsService.md = md
-}
-
+// ProcessMapSecretChange is not implemented.
 func (s *CsiNfsService) ProcessMapSecretChange() error {
 	return nil
 }
 
+// RegisterAdditionalServers is not implemented.
 func (s *CsiNfsService) RegisterAdditionalServers(server *grpc.Server) {
 }
 
+// VolumeIDToArrayID is not implemented.
 func (s *CsiNfsService) VolumeIDToArrayID(volID string) string {
 	return ""
 }
@@ -142,7 +194,7 @@ func (s *CsiNfsService) validateGlobalVariables() error {
 		if NodeRoot == "" {
 			return fmt.Errorf("csi-nfs NodeRoot variable must be set; used for chroot into node; validated with /noderoot/etc/exports")
 		}
-		_, err := os.Stat(NodeRoot + "/etc/exports")
+		_, err := opSys.Stat(NodeRoot + "/etc/exports")
 		if err != nil {
 			return fmt.Errorf("could not stat NodeRoot/etc/exports - this file must exist for kernel nfs installations")
 		}
@@ -154,7 +206,7 @@ func (s *CsiNfsService) validateGlobalVariables() error {
 		return fmt.Errorf("DriverNamespace variable not set; this is used to find Services and EndpointSlices in the driver namespace")
 	}
 	if DriverName == "" {
-		return fmt.Errorf("DriverName not set. This is the value of the driver name in the csinode objects, e.g. csi-vxflexos.dellemc.com ")
+		return fmt.Errorf("DriverName not set. This is the value of the driver name in the csinode objects, e.g. csi-vxflexos.dellemc.com")
 	}
 	log.Infof("NodeRoot %s NfsExportDirectory %s DriverNamespace %s DriverName %s", NodeRoot, NfsExportDirectory, DriverNamespace, DriverName)
 	return nil
@@ -168,16 +220,16 @@ var (
 	DriverName         string // The name of the driver as reported to the CSI nodes (e.g. csi-vxflexos.dellemc.com)
 )
 
-func (s *CsiNfsService) BeforeServe(ctx context.Context, sp *gocsi.StoragePlugin, lis net.Listener) error {
+func (s *CsiNfsService) BeforeServe(ctx context.Context, _ *gocsi.StoragePlugin, _ net.Listener) error {
 	log.Infof("NFS BeforeServe called")
 	var err error
 
 	// Get the SP's operating mode and nodeName
 	s.mode = csictx.Getenv(ctx, gocsi.EnvVarMode)
 
-	s.nodeName = os.Getenv("X_CSI_NODE_NAME")
+	s.nodeName = opSys.Getenv(EnvCSINodeName)
 	if s.nodeName == "" {
-		s.nodeName = os.Getenv("NODE_NAME")
+		s.nodeName = opSys.Getenv(EnvNodeName)
 	}
 	if s.nodeName == "" {
 		panic("X_CSI_NODE_NAME or NODE_NAME environment variable not set")
@@ -193,7 +245,8 @@ func (s *CsiNfsService) BeforeServe(ctx context.Context, sp *gocsi.StoragePlugin
 	log.Info("Connecting to k8sapi")
 	s.k8sclient, err = k8s.Connect()
 	if err != nil {
-		log.Error(err)
+		log.Errorf("failed to initialize the kubernetes client in BeforeServe. err: %s", err.Error())
+		return err
 	}
 	log.Infof("csinfs: K8sClient connected... s.mode %s", s.mode)
 
@@ -208,40 +261,41 @@ func (s *CsiNfsService) BeforeServe(ctx context.Context, sp *gocsi.StoragePlugin
 	if len(nodeAddresses) > 0 {
 		s.nodeIPAddress = nodeAddresses[0].Address
 	}
-	s.podCIDR = os.Getenv("PodCIDR")
+	s.podCIDR = opSys.Getenv(EnvPodCIDR)
 	if s.podCIDR == "" {
 		s.podCIDR = s.nodeIPAddress + "/8"
 	}
 	log.Infof("csinode nodeIPAddress %s podCIDR %s", s.nodeIPAddress, s.podCIDR)
 
-	// Set up an NFS server for the node pods
-	if s.mode == "node" {
-
-		// Get the NfsExportDirectory if set and use it.
-		if os.Getenv("NfsExportDirectory") != "" {
-			NfsExportDirectory = os.Getenv("NfsExportDir")
-		}
-		// Process the NfsExportDirectory
-		log.Infof("Looking for NFS Export Directory %s", NodeRoot+NfsExportDirectory)
-		if _, err = os.Stat(NodeRoot + NfsExportDirectory); err != nil {
-			err = os.MkdirAll(NodeRoot+NfsExportDirectory, 0777)
-			if err != nil {
-				log.Infof("MkdirAll %s failed: %s", NodeRoot+NfsExportDirectory, err.Error())
-			} else {
-				log.Infof("NfsExportDirecotry %s", NfsExportDirectory)
-			}
-		}
-
-		if err = s.initializeNfsServer(); err != nil {
-			log.Errorf("host nfs-server failed to initialize")
-		}
-
-		// Start the NFS server listener
-		// TODO: make port configurable from environment
-		go startNfsServiceServer(s.nodeIPAddress, nfsServerPort)
-	} else {
-		s.startNodeMonitors()
+	if s.mode != "node" {
+		return s.startNodeMonitors()
 	}
+
+	// Set up an NFS server for the node pods
+	// Process the NfsExportDirectory
+	log.Infof("Looking for NFS Export Directory %s", NodeRoot+NfsExportDirectory)
+	if _, err = opSys.Stat(NodeRoot + NfsExportDirectory); err != nil {
+		err = opSys.MkdirAll(NodeRoot+NfsExportDirectory, 0o777)
+		if err != nil {
+			log.Infof("MkdirAll %s failed: %s", NodeRoot+NfsExportDirectory, err.Error())
+		} else {
+			log.Infof("NfsExportDirecotry %s", NfsExportDirectory)
+		}
+	}
+
+	if err = s.initializeNfsServer(); err != nil {
+		log.Errorf("host nfs-server failed to initialize")
+	}
+
+	// Start the NFS server listener
+	// TODO: make port configurable from environment
+	go func() {
+		err := startNfsServiceServer(s.nodeIPAddress, nfsServerPort)
+		if err != nil {
+			log.Errorf("failed to start nfs service. err: %s", err.Error())
+		}
+	}()
+
 	return nil
 }
 
