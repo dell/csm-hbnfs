@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -34,10 +35,11 @@ import (
 var (
 	VolumeReassignTimeout = 180 * time.Second
 	exportCountsLock      sync.Mutex
+	endpointSliceTimeout  = 3 * time.Second
 )
 
 // exportCounts is a map of node name to number of mounts
-var exportCounts map[string]int
+var exportCounts map[string]int = make(map[string]int)
 
 // nodeRecovery is called as a goroutine from the pinger when it determines a node is down.
 // nodeRecovery is responsible for reassigning all the nfs volumes on the failed node to new servers.
@@ -54,10 +56,7 @@ func (s *CsiNfsService) nodeRecovery(nodeIp string) {
 	endpointSlices, err := s.k8sclient.GetEndpointSlices(ctx, DriverNamespace, selector)
 	log.Infof("pinger: GetEndpointSlices returned %d endpointSlices: %v", len(endpointSlices), err)
 
-	exportCounts, err = s.getNodeExportCounts(ctx)
-	if err != nil {
-		log.Errorf("Could not getNodeExportCounts, error: %s", err)
-	}
+	exportCounts = s.getNodeExportCounts(ctx)
 
 	// Process each volume to be moved in a go routine to move it.
 	start := time.Now()
@@ -76,13 +75,13 @@ func (s *CsiNfsService) nodeRecovery(nodeIp string) {
 		}()
 	}
 	var successes int
-	for i := 0; i < len(endpointSlices); i++ {
+	for range endpointSlices {
 		success := <-done
 		if success {
 			successes++
 		}
 	}
-	log.Infof("reassignVolumes %d successful out of %d in %s", successes, len(endpointSlices), time.Now().Sub(start))
+	log.Infof("reassignVolumes %d successful out of %d in %s", successes, len(endpointSlices), time.Since(start))
 }
 
 // reassignVolume recovers a Volume determined from the EndpointSlice and returns true if successful.
@@ -120,9 +119,9 @@ func (s *CsiNfsService) reassignVolume(slice *discoveryv1.EndpointSlice) bool {
 	log.Infof("reassignVolume %s clients %v", pv.Name, clients)
 
 	// Loop through the available nodes and see which one has the lowest count
-	lowest := 999999999
+	lowest := math.MaxInt
 	var selectedNode string
-	var aboveThreshold bool
+	aboveThreshold := false
 	exportCountsLock.Lock()
 	for nodeName, exportCount := range exportCounts {
 		if exportCount < lowest {
@@ -173,7 +172,7 @@ func (s *CsiNfsService) reassignVolume(slice *discoveryv1.EndpointSlice) bool {
 			pv.Name, controllerUnpublishVolumeRequest, err)
 		return false
 	}
-	log.Infof("reassignVolume %s ControllerUnpublishVolume complete %s", pv.Name, time.Now().Sub(start))
+	log.Infof("reassignVolume %s ControllerUnpublishVolume complete %s", pv.Name, time.Since(start))
 
 	// Publish the volume to the new node
 	node, err := s.k8sclient.GetNode(ctx, selectedNode)
@@ -225,7 +224,7 @@ func (s *CsiNfsService) reassignVolume(slice *discoveryv1.EndpointSlice) bool {
 		log.Errorf("reassignVolume %s got error on ControllerPublishVolume: %s", pv.Name, err)
 		return false
 	}
-	log.Infof("contollerPublishVolumes completed %v %s", controllerPublishVolumeResponse, time.Now().Sub(start))
+	log.Infof("contollerPublishVolumes completed %v %s", controllerPublishVolumeResponse, time.Since(start))
 
 	// Send a request to the node to mount the volume
 	start = time.Now()
@@ -243,7 +242,7 @@ func (s *CsiNfsService) reassignVolume(slice *discoveryv1.EndpointSlice) bool {
 		log.Errorf("callExportNfsVolume failed %s %s: %s", exportNfsVolumeRequest.VolumeId, nodeIPAddress, nodeError)
 		return false
 	}
-	log.Infof("ExportNfsVolume %s %s completed successfully %s", slice.Name, nodeIPAddress, time.Now().Sub(start))
+	log.Infof("ExportNfsVolume %s %s completed successfully %s", slice.Name, nodeIPAddress, time.Since(start))
 
 	// Update the EndpointSlice
 	slice.Labels["nodeID"] = DriverNodeName
@@ -256,7 +255,7 @@ func (s *CsiNfsService) reassignVolume(slice *discoveryv1.EndpointSlice) bool {
 			break
 		}
 		log.Errorf("Update EndpointSlice %s address %s retries %d failed: %s", slice.Name, slice.Labels["nodeIP"], retries, err)
-		time.Sleep(3 * time.Second)
+		time.Sleep(endpointSliceTimeout)
 	}
 
 	return true
